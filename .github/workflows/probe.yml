@@ -1,0 +1,53 @@
+name: Probe Madeira build inputs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download corresponding source and official IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L --fail --retry 3 -o /tmp/source.zip "https://github.com/dre4moff/Madeira/releases/download/v0.1.1-fork-r19/Madeira-0.1.1-Fork-r19-Corresponding-Source.zip"
+          curl -L --fail --retry 3 -o /tmp/madeira.ipa "https://github.com/willfaust/Madeira/releases/download/v0.1.3/Madeira-0.1.3.ipa"
+          mkdir -p /tmp/source /tmp/ipa probe
+          unzip -q /tmp/source.zip -d /tmp/source
+          unzip -q /tmp/madeira.ipa -d /tmp/ipa
+
+      - name: Inventory source package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          {
+            echo '=== STATIC LIBRARIES ==='
+            find /tmp/source -type f \( -name '*.a' -o -name '*.xcframework' \) -print | sort
+            echo '=== BUILD TREES ==='
+            find /tmp/source -type d \( -name 'build-macos' -o -name 'build-ios' -o -name 'llvm-ios-build' -o -name 'llvm-host-build' \) -print | sort
+            echo '=== IMPORTANT FILES ==='
+            find /tmp/source -type f \( -name 'config.h' -o -name 'CMakeCache.txt' -o -name 'libwineserver.a' -o -name 'libntdll_unix.a' -o -name 'libwin32u_unix.a' -o -name 'libdxmt_combined.a' -o -name 'libFEXCore.a' \) -print | sort
+            echo '=== TOP LEVEL ==='
+            find /tmp/source -maxdepth 3 -type d | sort | head -500
+          } | tee probe/source-inventory.txt
+
+      - name: Inventory official IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          {
+            echo '=== APP FILES ==='
+            find /tmp/ipa/Payload -maxdepth 4 -type f -printf '%p %s bytes\n' | sort
+            echo '=== APP DIRECTORIES ==='
+            find /tmp/ipa/Payload -maxdepth 4 -type d | sort
+          } | tee probe/ipa-inventory.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: madeira-probe
+          path: probe/
