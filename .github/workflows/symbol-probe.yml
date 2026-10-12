@@ -1,0 +1,39 @@
+name: Probe Madeira exported symbols
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Download IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L --fail --retry 3 -o /tmp/madeira.ipa "https://github.com/willfaust/Madeira/releases/download/v0.1.3/Madeira-0.1.3.ipa"
+          mkdir -p /tmp/ipa probe
+          unzip -q /tmp/madeira.ipa -d /tmp/ipa
+          APP=/tmp/ipa/Payload/Madeira.app
+          {
+            echo '=== MAIN OTOOL -L ==='
+            otool -L "$APP/Madeira"
+            echo '=== MAIN LOAD COMMANDS ==='
+            otool -l "$APP/Madeira"
+            echo '=== DEBUG DYLIB OTOOL -L ==='
+            otool -L "$APP/Madeira.debug.dylib"
+            echo '=== DEBUG DYLIB ID/LOAD COMMANDS ==='
+            otool -l "$APP/Madeira.debug.dylib"
+            echo '=== TARGET EXPORTED SYMBOLS ==='
+            nm -gU "$APP/Madeira.debug.dylib" | egrep 'wine_process_start|wine_process_is_running|wineserver_start|wineserver_is_running|wine_process_stop|wineserver_stop|MADEIRA|wine_' | head -400 || true
+            echo '=== ALL EXPORTED C-LIKE SYMBOLS SAMPLE ==='
+            nm -gU "$APP/Madeira.debug.dylib" | head -800
+          } | tee probe/symbols.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: madeira-symbol-probe
+          path: probe/ 
