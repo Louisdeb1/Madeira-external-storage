@@ -1,0 +1,324 @@
+name: Build Madeira External Storage IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Download and verify Madeira 0.1.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 -o /tmp/Madeira.ipa \
+            "https://github.com/willfaust/Madeira/releases/download/v0.1.3/Madeira-0.1.3.ipa"
+          echo "71e900cbc140778bd6fa67c1062821981ed98e6bfb674d853cfeefd6d242e1c0  /tmp/Madeira.ipa" | shasum -a 256 -c -
+          mkdir -p /tmp/work
+          unzip -q /tmp/Madeira.ipa -d /tmp/work
+          test -f /tmp/work/Payload/Madeira.app/Madeira.debug.dylib
+
+      - name: Verify exported launcher symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=/tmp/work/Payload/Madeira.app
+          nm -gU "$APP/Madeira.debug.dylib" > /tmp/madeira-symbols.txt
+          for s in _wine_process_start _wine_process_is_running _wineserver_start _wineserver_is_running _wineserver_stop; do
+            grep -q " $s$" /tmp/madeira-symbols.txt || { echo "Missing symbol: $s"; exit 1; }
+          done
+
+      - name: Save original entitlements
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=/tmp/work/Payload/Madeira.app
+          codesign -d --entitlements :- "$APP" > /tmp/app-entitlements.plist 2>/dev/null || true
+          if [ -d "$APP/PlugIns/MadeiraJITHelper.appex" ]; then
+            codesign -d --entitlements :- "$APP/PlugIns/MadeiraJITHelper.appex" > /tmp/helper-entitlements.plist 2>/dev/null || true
+          fi
+          test -s /tmp/app-entitlements.plist
+
+      - name: Build USB SSD launcher wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=/tmp/work/Payload/Madeira.app
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+
+          mv "$APP/Madeira.debug.dylib" "$APP/Morig.dylib"
+          install_name_tool -id '@loader_path/Morig.dylib' "$APP/Morig.dylib"
+
+          cat > /tmp/ExternalStorageOverlay.m &lt;&lt;'OBJC'
+          @import UIKit;
+          @import Foundation;
+          @import UniformTypeIdentifiers;
+          @import QuartzCore;
+          #include &lt;stdlib.h&gt;
+          #include &lt;unistd.h&gt;
+
+          extern int wineserver_start(const char *prefix_path);
+          extern int wineserver_is_running(void);
+          extern void wineserver_stop(void);
+          extern int wine_process_start(const char *prefix_path);
+          extern int wine_process_is_running(void);
+
+          @interface MXExternalLauncher : NSObject &lt;UIDocumentPickerDelegate&gt;
+          @property(nonatomic,strong) UIButton *button;
+          @property(nonatomic,strong) NSURL *scopedURL;
+          @property(nonatomic,assign) BOOL scopeStarted;
+          @end
+
+          @implementation MXExternalLauncher
+
+          + (instancetype)shared {
+              static MXExternalLauncher *obj;
+              static dispatch_once_t once;
+              dispatch_once(&amp;once, ^{ obj = [MXExternalLauncher new]; });
+              return obj;
+          }
+
+          - (UIWindow *)activeWindow {
+              for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                  if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+                  if (![scene isKindOfClass:UIWindowScene.class]) continue;
+                  UIWindowScene *ws = (UIWindowScene *)scene;
+                  for (UIWindow *w in ws.windows) if (w.isKeyWindow) return w;
+                  if (ws.windows.firstObject) return ws.windows.firstObject;
+              }
+              return UIApplication.sharedApplication.windows.firstObject;
+          }
+
+          - (UIViewController *)topController {
+              UIViewController *vc = [self activeWindow].rootViewController;
+              while (vc.presentedViewController) vc = vc.presentedViewController;
+              if ([vc isKindOfClass:UINavigationController.class]) vc = ((UINavigationController *)vc).topViewController;
+              if ([vc isKindOfClass:UITabBarController.class]) vc = ((UITabBarController *)vc).selectedViewController;
+              return vc;
+          }
+
+          - (void)alert:(NSString *)title message:(NSString *)message {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  UIViewController *vc = [self topController];
+                  if (!vc) return;
+                  UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
+                  [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                  [vc presentViewController:a animated:YES completion:nil];
+              });
+          }
+
+          - (void)installButtonWhenReady:(NSInteger)attempt {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  UIWindow *w = [self activeWindow];
+                  if (!w) {
+                      if (attempt &lt; 20) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self installButtonWhenReady:attempt + 1]; });
+                      return;
+                  }
+                  if (self.button.superview) return;
+                  UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+                  b.frame = CGRectMake(MAX(12.0, w.bounds.size.width - 82.0), w.safeAreaInsets.top + 12.0, 68.0, 42.0);
+                  b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+                  [b setTitle:@"USB / SSD" forState:UIControlStateNormal];
+                  b.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+                  b.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.82];
+                  [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+                  b.layer.cornerRadius = 14.0;
+                  b.layer.borderWidth = 1.0;
+                  b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
+                  b.accessibilityLabel = @"Lancer un jeu depuis USB ou SSD";
+                  [b addTarget:self action:@selector(pickFolder) forControlEvents:UIControlEventTouchUpInside];
+                  [w addSubview:b];
+                  [w bringSubviewToFront:b];
+                  self.button = b;
+              });
+          }
+
+          - (void)pickFolder {
+              if (wine_process_is_running()) {
+                  [self alert:@"Madeira" message:@"Un jeu est déjà en cours. Ferme-le avant d'en lancer un autre depuis le stockage externe."];
+                  return;
+              }
+              UIViewController *vc = [self topController];
+              if (!vc) return;
+              UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTType.folder] asCopy:NO];
+              picker.delegate = self;
+              picker.allowsMultipleSelection = NO;
+              [vc presentViewController:picker animated:YES completion:nil];
+          }
+
+          - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray&lt;NSURL *&gt;)urls {
+              NSURL *root = urls.firstObject;
+              if (!root) return;
+              if (self.scopeStarted &amp;&amp; self.scopedURL) [self.scopedURL stopAccessingSecurityScopedResource];
+              self.scopedURL = root;
+              self.scopeStarted = [root startAccessingSecurityScopedResource];
+              [self chooseExecutableUnder:root];
+          }
+
+          - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {}
+
+          - (void)chooseExecutableUnder:(NSURL *)root {
+              NSFileManager *fm = NSFileManager.defaultManager;
+              NSArray *keys = @[NSURLIsDirectoryKey, NSURLNameKey];
+              NSDirectoryEnumerator&lt;NSURL *&gt; *en = [fm enumeratorAtURL:root includingPropertiesForKeys:keys options:NSDirectoryEnumerationSkipsHiddenFiles errorHandler:^BOOL(NSURL *url, NSError *error) { return YES; }];
+              NSMutableArray&lt;NSURL *&gt; *exes = [NSMutableArray array];
+              NSUInteger rootDepth = root.pathComponents.count;
+              for (NSURL *u in en) {
+                  NSNumber *isDir = nil;
+                  [u getResourceValue:&amp;isDir forKey:NSURLIsDirectoryKey error:nil];
+                  NSUInteger depth = u.pathComponents.count - rootDepth;
+                  if (isDir.boolValue &amp;&amp; depth &gt;= 4) { [en skipDescendants]; continue; }
+                  if (!isDir.boolValue &amp;&amp; [u.pathExtension.lowercaseString isEqualToString:@"exe"]) {
+                      [exes addObject:u];
+                      if (exes.count &gt;= 50) break;
+                  }
+              }
+              if (!exes.count) {
+                  [self alert:@"Aucun .exe" message:@"Je n'ai trouvé aucun fichier .exe dans ce dossier (recherche jusqu'à 4 niveaux)."];
+                  return;
+              }
+              [exes sortUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) { return [a.lastPathComponent localizedCaseInsensitiveCompare:b.lastPathComponent]; }];
+              UIViewController *vc = [self topController];
+              if (!vc) return;
+              UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Choisir l'EXE" message:@"Le jeu restera sur ton USB/SSD. Madeira utilisera un lien symbolique dans son disque C:." preferredStyle:UIAlertControllerStyleActionSheet];
+              for (NSURL *exe in exes) {
+                  NSString *relative = exe.path;
+                  if ([relative hasPrefix:root.path]) relative = [relative substringFromIndex:MIN(relative.length, root.path.length + 1)];
+                  NSString *label = relative.length ? relative : exe.lastPathComponent;
+                  [sheet addAction:[UIAlertAction actionWithTitle:label style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { [self launchExecutable:exe]; }]];
+              }
+              [sheet addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+              UIPopoverPresentationController *pop = sheet.popoverPresentationController;
+              if (pop) { pop.sourceView = self.button ?: vc.view; pop.sourceRect = self.button ? self.button.bounds : CGRectMake(vc.view.bounds.size.width - 1, 1, 1, 1); }
+              [vc presentViewController:sheet animated:YES completion:nil];
+          }
+
+          - (void)launchExecutable:(NSURL *)exe {
+              NSString *filename = exe.lastPathComponent;
+              if (![filename canBeConvertedToEncoding:NSASCIIStringEncoding]) {
+                  [self alert:@"Nom de fichier" message:@"Pour cette version, le nom du .exe doit utiliser uniquement des caractères ASCII. Renomme uniquement le fichier .exe puis réessaie."];
+                  return;
+              }
+              NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+              if (!documents.length) { [self alert:@"Erreur" message:@"Dossier Documents introuvable."]; return; }
+              NSString *prefix = [documents stringByAppendingPathComponent:@"wine"];
+              NSString *driveC = [prefix stringByAppendingPathComponent:@"drive_c"];
+              NSString *link = [driveC stringByAppendingPathComponent:@"__ExternalGame"];
+              NSFileManager *fm = NSFileManager.defaultManager;
+              NSError *err = nil;
+              [fm createDirectoryAtPath:driveC withIntermediateDirectories:YES attributes:nil error:&amp;err];
+              if (err) { [self alert:@"Erreur" message:err.localizedDescription]; return; }
+              [fm removeItemAtPath:link error:nil];
+              err = nil;
+              NSString *hostDir = exe.URLByDeletingLastPathComponent.path;
+              if (![fm createSymbolicLinkAtPath:link withDestinationPath:hostDir error:&amp;err]) {
+                  [self alert:@"Lien USB/SSD impossible" message:err.localizedDescription ?: @"Impossible de créer le lien symbolique."];
+                  return;
+              }
+
+              NSString *winExe = [NSString stringWithFormat:@"C:\\__ExternalGame\\%@", filename];
+              setenv("MADEIRA_EXE", winExe.UTF8String, 1);
+              setenv("MADEIRA_WORKDIR", "C:\\__ExternalGame", 1);
+              unsetenv("MADEIRA_ARGS");
+
+              if (wine_process_is_running()) {
+                  [self alert:@"Madeira" message:@"Un jeu est déjà en cours."];
+                  return;
+              }
+
+              int ws = wineserver_is_running();
+              if (!ws) {
+                  int rc = wineserver_start(prefix.fileSystemRepresentation);
+                  if (rc != 0) { [self alert:@"wineserver" message:[NSString stringWithFormat:@"Impossible de démarrer wineserver (code %d).", rc]]; return; }
+              }
+
+              __block NSInteger tries = 0;
+              __weak typeof(self) weakSelf = self;
+              __block void (^poll)(void) = nil;
+              poll = ^{
+                  tries++;
+                  if (wineserver_is_running()) {
+                      int rc = wine_process_start(prefix.fileSystemRepresentation);
+                      if (rc != 0) [weakSelf alert:@"Lancement impossible" message:[NSString stringWithFormat:@"wine_process_start a renvoyé %d.", rc]];
+                      else [weakSelf alert:@"Lancement" message:[NSString stringWithFormat:@"%@ est lancé directement depuis le stockage externe.", filename]];
+                      poll = nil;
+                      return;
+                  }
+                  if (tries &gt;= 80) {
+                      [weakSelf alert:@"wineserver" message:@"wineserver ne s'est pas déclaré prêt."];
+                      poll = nil;
+                      return;
+                  }
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), poll);
+              };
+              dispatch_async(dispatch_get_main_queue(), poll);
+          }
+          @end
+
+          __attribute__((constructor))
+          static void MXInstallExternalStorageOverlay(void) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  [[MXExternalLauncher shared] installButtonWhenReady:0];
+              });
+          }
+          OBJC
+
+          xcrun --sdk iphoneos clang \
+            -target arm64-apple-ios17.0 \
+            -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -fblocks \
+            -framework UIKit -framework Foundation -framework UniformTypeIdentifiers -framework QuartzCore \
+            -Wl,-reexport_library,"$APP/Morig.dylib" \
+            -Wl,-install_name,@rpath/Madeira.debug.dylib \
+            /tmp/ExternalStorageOverlay.m \
+            -o "$APP/Madeira.debug.dylib"
+
+          echo '=== Wrapper dependencies ==='
+          otool -L "$APP/Madeira.debug.dylib"
+          echo '=== Main dependency ==='
+          otool -L "$APP/Madeira" | head -10
+          otool -l "$APP/Madeira.debug.dylib" | grep -A4 -E 'LC_REEXPORT_DYLIB|LC_ID_DYLIB' || true
+
+      - name: Ad-hoc sign modified bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=/tmp/work/Payload/Madeira.app
+          rm -rf "$APP/_CodeSignature"
+          codesign --force --sign - "$APP/Morig.dylib"
+          codesign --force --sign - "$APP/Madeira.debug.dylib"
+          if [ -d "$APP/Frameworks/StikJIT.framework" ]; then
+            codesign --force --sign - "$APP/Frameworks/StikJIT.framework"
+          fi
+          if [ -d "$APP/PlugIns/MadeiraJITHelper.appex" ]; then
+            rm -rf "$APP/PlugIns/MadeiraJITHelper.appex/_CodeSignature"
+            if [ -s /tmp/helper-entitlements.plist ]; then
+              codesign --force --sign - --entitlements /tmp/helper-entitlements.plist "$APP/PlugIns/MadeiraJITHelper.appex"
+            else
+              codesign --force --sign - "$APP/PlugIns/MadeiraJITHelper.appex"
+            fi
+          fi
+          codesign --force --sign - --entitlements /tmp/app-entitlements.plist "$APP"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/Payload
+          ditto /tmp/work/Payload/Madeira.app out/Payload/Madeira.app
+          (cd out && zip -qry Madeira-external-storage.ipa Payload)
+          shasum -a 256 out/Madeira-external-storage.ipa | tee out/Madeira-external-storage.ipa.sha256
+          ls -lh out/Madeira-external-storage.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-external-storage-IPA
+          path: |
+            out/Madeira-external-storage.ipa
+            out/Madeira-external-storage.ipa.sha256
+          if-no-files-found: error
