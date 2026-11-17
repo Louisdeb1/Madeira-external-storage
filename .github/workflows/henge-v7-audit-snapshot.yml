@@ -1,0 +1,40 @@
+name: Henge SSD V7 source audit snapshot
+on:
+  push:
+    branches: [henge-ssd-v7-audit-20261117]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Fetch and apply Henge patches for full audit
+      shell: bash
+      run: |
+        set -euxo pipefail
+        git clone --filter=blob:none https://github.com/Leviidev/Henge.git original
+        git -C original checkout 3ff5cfe64e58
+        mkdir patches
+        base64 -d henge-ssd/patch-v4.b64 | tar -xJf - -C patches
+        base64 -d henge-ssd/patch-v5.b64 | tar -xzf - -C patches
+        cat henge-ssd/v6.part*.b64 | base64 -d | tar -xzf - -C patches
+        python3 patches/apply_external_ssd.py original
+        sed -i 's/^            error = error.localizedDescription$/            self.error = error.localizedDescription/' original/ios/Henge/SessionView.swift
+        python3 patches/patch_file_picker.py original
+        python3 patches/patch_pickable_seed_v6.py original
+        mkdir -p snapshot
+        cp -a original/ios/Henge snapshot/
+        cp -a original/ios/scripts snapshot/
+        cp -a original/ios/project.yml snapshot/
+        cp -a original/host snapshot/
+        cp -a original/ios/README.md snapshot/ios_readme.md
+        cp -a patches snapshot/
+        tar -czf audit-source.tar.gz -C snapshot .
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Henge-SSD-V6-complete-source-audit
+        path: audit-source.tar.gz
+        if-no-files-found: error
+        retention-days: 1
